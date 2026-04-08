@@ -37,6 +37,20 @@ cd llm-wiki-agent-nodejs
 pnpm install
 ```
 
+## Simplest Way To Use
+
+The recommended path is to open this repo in a Code Agent IDE and use the built-in skills from the chat window. In that mode, the agent reads `AGENTS.md`, follows the wiki workflows, and you can operate the whole wiki in plain English without wiring up CLI commands first.
+
+1. Open this repository in a Code Agent IDE that supports project instructions and skills, such as Codex, Cursor, OpenCode, or Claude Code.
+2. In the chat window, ask the agent directly, for example: `ingest raw/AMS项目架构与业务分析报告.md`
+3. Continue from chat with commands like `query: what does the wiki say about AMS?`, `lint`, or `build graph`
+
+### Obsidian Example
+
+After the wiki pages are generated, you can open the `wiki/` folder as a vault in Obsidian to browse backlinks and the graph view.
+
+![Obsidian graph view example](docs/images/obsidian-关系图.png)
+
 ## Supported Code Agent IDEs
 
 Open in any of these agents — no API key setup needed for agent-native use:
@@ -66,6 +80,8 @@ All IDE instruction files reference `WIKI_SCHEMA.md` — the single source of tr
 ## Usage
 
 ### Via Agent (Recommended)
+
+This is the default workflow. Use the chat window and let the agent call the relevant skill/workflow for you.
 
 Tell the agent what you want:
 

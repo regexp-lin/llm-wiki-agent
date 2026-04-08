@@ -37,6 +37,20 @@ cd llm-wiki-agent-nodejs
 pnpm install
 ```
 
+## 最简单的使用方式
+
+最推荐的方式，是把这个仓库直接打开在支持 skills 的 Code Agent IDE 里，然后在聊天窗口里操作。这样智能体会读取 `AGENTS.md`，自动按 wiki workflow 执行，你不需要先记 CLI，也不需要额外接 API。
+
+1. 用支持项目指令和 skills 的 Code Agent IDE 打开这个仓库，例如 Codex、Cursor、OpenCode 或 Claude Code。
+2. 在聊天窗口直接输入一句话，例如：`ingest raw/AMS项目架构与业务分析报告.md`
+3. 后续继续在聊天里输入：`query: AMS 的核心架构是什么？`、`lint`、`build graph`
+
+### Obsidian 打开示例
+
+生成 wiki 页面后，可以直接把 `wiki/` 目录作为 Obsidian vault 打开，用双向链接和关系图查看个人知识库。
+
+![Obsidian 关系图示例](docs/images/obsidian-关系图.png)
+
 ## 支持的代码智能体 IDE
 
 可以在以下任何智能体中打开 — 在原生智能体环境中使用不需要配置 API Key：
@@ -66,6 +80,8 @@ gemini          # 读取 GEMINI.md
 ## 使用方法
 
 ### 通过智能体使用 (推荐)
+
+这是默认推荐工作流。直接在聊天窗口里说需求，让智能体调用对应的 skill / workflow 即可。
 
 直接告诉智能体你想要做什么：
 
