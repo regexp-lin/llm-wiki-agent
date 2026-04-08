@@ -77,3 +77,34 @@ export interface InferredRelation {
 export interface GraphCache {
   [filePath: string]: string;
 }
+
+// --- Ingest Cache ---
+
+export interface IngestCacheEntry {
+  content_hash: string;
+  slug: string;
+  source_page: string;
+  ingested_at: string;
+  title: string;
+}
+
+export interface IngestCache {
+  version: number;
+  entries: Record<string, IngestCacheEntry>;
+}
+
+export type IngestFileStatus = "NEW" | "CHANGED" | "OUTPUT_MISSING" | "CACHED" | "FORCED";
+
+export interface IngestCandidate {
+  relativePath: string;
+  absolutePath: string;
+  status: IngestFileStatus;
+  contentHash: string;
+  cachedEntry?: IngestCacheEntry;
+}
+
+export interface IngestBatchOptions {
+  force?: boolean;
+  dryRun?: boolean;
+  concurrency?: number;
+}

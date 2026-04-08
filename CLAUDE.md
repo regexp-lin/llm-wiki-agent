@@ -6,13 +6,14 @@ This wiki is maintained entirely by Claude Code. No API key or Node.js scripts n
 
 | Command | What to say |
 |---|---|
-| `/wiki-ingest` | `ingest raw/my-article.md` |
+| `/wiki-ingest` | `ingest raw/my-article.md` or just `ingest` (batch mode) |
 | `/wiki-query` | `query: what are the main themes?` |
 | `/wiki-lint` | `lint the wiki` |
 | `/wiki-graph` | `build the knowledge graph` |
 
 Or just describe what you want in plain English:
 - *"Ingest this file: raw/papers/attention-is-all-you-need.md"*
+- *"Ingest all new files"* (batch mode)
 - *"What does the wiki say about transformer models?"*
 - *"Check the wiki for orphan pages and contradictions"*
 - *"Build the graph and show me what's connected to RAG"*
@@ -27,18 +28,37 @@ Read `WIKI_SCHEMA.md` at the project root for the full wiki data model: director
 
 ## Ingest Workflow
 
+### Single File Mode
+
 Triggered by: *"ingest <file>"* or `/wiki-ingest`
 
 Steps (in order):
-1. Read the source document fully using the Read tool
-2. Read `wiki/index.md` and `wiki/overview.md` for current wiki context
-3. Write `wiki/sources/<slug>.md` — use the source page format per WIKI_SCHEMA.md
-4. Update `wiki/index.md` — add entry under Sources section
-5. Update `wiki/overview.md` — revise synthesis if warranted
-6. Update/create entity pages for key people, companies, projects mentioned
-7. Update/create concept pages for key ideas and frameworks discussed
-8. Flag any contradictions with existing wiki content
-9. Append to `wiki/log.md`: `## [YYYY-MM-DD] ingest | <Title>`
+1. Read `wiki/.ingest-cache.json` and compute the source file's SHA256
+2. Check cache: if file is cached and output exists, print "Skipped (cached)" and stop
+3. Read the source document fully using the Read tool
+4. Read `wiki/index.md` and `wiki/overview.md` for current wiki context
+5. Write `wiki/sources/<slug>.md` — use the source page format per WIKI_SCHEMA.md
+6. Update `wiki/index.md` — add entry under Sources section
+7. Update `wiki/overview.md` — revise synthesis if warranted
+8. Update/create entity pages for key people, companies, projects mentioned
+9. Update/create concept pages for key ideas and frameworks discussed
+10. Flag any contradictions with existing wiki content
+11. Append to `wiki/log.md`: `## [YYYY-MM-DD] ingest | <Title>`
+12. Update `wiki/.ingest-cache.json` with the new entry
+
+Use `--force` to bypass cache.
+
+### Batch Mode
+
+Triggered by: *"ingest"* (no file argument) or *"ingest all"*
+
+Steps:
+1. Scan `raw/` directory recursively for all `.md` and `.txt` files
+2. Read `wiki/.ingest-cache.json`
+3. Classify each file: NEW / CHANGED / OUTPUT_MISSING / CACHED
+4. Report scan results
+5. For each file that needs processing, execute single-file ingest
+6. Update cache after each successful ingest
 
 ---
 

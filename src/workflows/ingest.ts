@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -13,11 +12,17 @@ import {
 } from "../shared/constants.js";
 import { readFile, writeFile, appendLog } from "../shared/file-utils.js";
 import { getClient, parseJsonFromResponse } from "../shared/llm-utils.js";
-import type { IngestResult, PageUpdate } from "../shared/types.js";
-
-function sha256(text: string): string {
-  return crypto.createHash("sha256").update(text).digest("hex").slice(0, 16);
-}
+import {
+  sha256,
+  loadIngestCache,
+  saveIngestCache,
+  scanRawDirectory,
+  classifyFile,
+  updateCacheEntry,
+  removeStaleCacheEntries,
+  formatStatus,
+} from "../shared/ingest-cache.js";
+import type { IngestResult, IngestCandidate, IngestCache, PageUpdate, IngestBatchOptions } from "../shared/types.js";
 
 async function buildWikiContext(): Promise<string> {
   const parts: string[] = [];
@@ -81,29 +86,23 @@ function isIngestResult(data: unknown): data is IngestResult {
   return typeof d.slug === "string" && typeof d.source_page === "string";
 }
 
-export async function ingest(sourcePath: string): Promise<void> {
-  const resolvedPath = path.resolve(sourcePath);
-
-  try {
-    await fs.access(resolvedPath);
-  } catch {
-    console.log(`Error: file not found: ${sourcePath}`);
-    process.exit(1);
-  }
-
-  const sourceContent = await fs.readFile(resolvedPath, "utf-8");
-  const sourceHash = sha256(sourceContent);
+async function ingestSingleInternal(
+  absolutePath: string,
+  cache: IngestCache,
+  precomputedHash?: string,
+): Promise<{ slug: string; title: string; contentHash: string } | null> {
+  const sourceContent = await fs.readFile(absolutePath, "utf-8");
+  const sourceHash = precomputedHash ?? sha256(sourceContent);
   const today = new Date().toISOString().slice(0, 10);
+  const sourceName = path.basename(absolutePath);
+  const relPath = absolutePath.startsWith(REPO_ROOT)
+    ? path.relative(REPO_ROOT, absolutePath)
+    : sourceName;
 
-  const sourceName = path.basename(resolvedPath);
   console.log(`\nIngesting: ${sourceName}  (hash: ${sourceHash})`);
 
   const wikiContext = await buildWikiContext();
   const schema = await readFile(SCHEMA_FILE);
-
-  const relPath = resolvedPath.startsWith(REPO_ROOT)
-    ? path.relative(REPO_ROOT, resolvedPath)
-    : sourceName;
 
   const prompt = `You are maintaining an LLM Wiki. Process this source document and integrate its knowledge into the wiki.
 
@@ -149,7 +148,7 @@ Return ONLY a valid JSON object with these fields (no markdown fences, no prose 
   const firstBlock = response.content[0];
   if (!firstBlock || firstBlock.type !== "text") {
     console.log("Error: unexpected API response format");
-    process.exit(1);
+    return null;
   }
   const raw = firstBlock.text;
 
@@ -167,41 +166,162 @@ Return ONLY a valid JSON object with these fields (no markdown fences, no prose 
     const debugPath = path.join(debugDir, "ingest_debug.txt");
     await fs.writeFile(debugPath, raw, "utf-8");
     console.log(`Raw response saved to ${path.relative(REPO_ROOT, debugPath)}`);
-    process.exit(1);
+    return null;
   }
 
-  // Write source page
   await writeFile(path.join(WIKI_DIR, "sources", `${data.slug}.md`), data.source_page);
 
-  // Write entity pages
   for (const page of data.entity_pages ?? []) {
     await writeFile(path.join(WIKI_DIR, (page as PageUpdate).path), (page as PageUpdate).content);
   }
 
-  // Write concept pages
   for (const page of data.concept_pages ?? []) {
     await writeFile(path.join(WIKI_DIR, (page as PageUpdate).path), (page as PageUpdate).content);
   }
 
-  // Update overview
   if (data.overview_update) {
     await writeFile(OVERVIEW_FILE, data.overview_update);
   }
 
-  // Update index
   await updateIndex(data.index_entry, "Sources");
-
-  // Append log
   await appendLog(data.log_entry);
 
-  // Report contradictions
   const contradictions = data.contradictions ?? [];
   if (contradictions.length > 0) {
-    console.log("\n  ⚠️  Contradictions detected:");
+    console.log("\n  Contradictions detected:");
     for (const c of contradictions) {
       console.log(`     - ${c}`);
     }
   }
 
-  console.log(`\nDone. Ingested: ${data.title}`);
+  const relativePath = path.relative(REPO_ROOT, absolutePath);
+  updateCacheEntry(cache, relativePath, sourceHash, data.slug, data.title);
+
+  console.log(`Done. Ingested: ${data.title}`);
+  return { slug: data.slug, title: data.title, contentHash: sourceHash };
 }
+
+export async function ingestSingle(sourcePath: string, opts?: { force?: boolean }): Promise<void> {
+  const resolvedPath = path.resolve(sourcePath);
+  const force = opts?.force ?? false;
+
+  try {
+    await fs.access(resolvedPath);
+  } catch {
+    console.log(`Error: file not found: ${sourcePath}`);
+    process.exit(1);
+  }
+
+  const cache = await loadIngestCache();
+  const candidate = await classifyFile(resolvedPath, cache, force);
+
+  if (candidate.status === "CACHED") {
+    console.log(`Skipped (cached): ${candidate.relativePath}`);
+    return;
+  }
+
+  console.log(`${formatStatus(candidate.status)} ${candidate.relativePath}`);
+
+  const result = await ingestSingleInternal(resolvedPath, cache, candidate.contentHash);
+  if (result) {
+    await saveIngestCache(cache);
+  }
+}
+
+export async function ingestBatch(opts?: IngestBatchOptions): Promise<void> {
+  const force = opts?.force ?? false;
+  const dryRun = opts?.dryRun ?? false;
+  const concurrency = opts?.concurrency ?? 1;
+
+  const files = await scanRawDirectory();
+  if (files.length === 0) {
+    console.log("No supported files found in raw/ directory.");
+    return;
+  }
+
+  const cache = await loadIngestCache();
+
+  const existingRelPaths = new Set(files.map((f) => path.relative(REPO_ROOT, f)));
+  const staleRemoved = removeStaleCacheEntries(cache, existingRelPaths);
+  if (staleRemoved > 0) {
+    console.log(`  Removed ${staleRemoved} stale cache entries (source files deleted).`);
+  }
+
+  const candidates: IngestCandidate[] = [];
+  for (const f of files) {
+    candidates.push(await classifyFile(f, cache, force));
+  }
+
+  const toProcess = candidates.filter((c) => c.status !== "CACHED");
+  const skipped = candidates.filter((c) => c.status === "CACHED");
+
+  console.log(`\nScan complete: ${files.length} files found`);
+  console.log(`  To process: ${toProcess.length}`);
+  console.log(`  Skipped:    ${skipped.length}`);
+  if (toProcess.length > 0) {
+    for (const c of toProcess) {
+      console.log(`    ${formatStatus(c.status)} ${c.relativePath}`);
+    }
+  }
+
+  if (dryRun) {
+    console.log("\n--dry-run: no files were processed.");
+    return;
+  }
+
+  if (toProcess.length === 0) {
+    console.log("\nAll files are up to date. Nothing to do.");
+    return;
+  }
+
+  let processed = 0;
+  let failed = 0;
+
+  if (concurrency > 1) {
+    let nextIdx = 0;
+    const workers = Array.from({ length: Math.min(concurrency, toProcess.length) }, async () => {
+      while (nextIdx < toProcess.length) {
+        const idx = nextIdx++;
+        const c = toProcess[idx]!;
+        console.log(`\n[${idx + 1}/${toProcess.length}] Ingesting: ${c.relativePath}`);
+        try {
+          const result = await ingestSingleInternal(c.absolutePath, cache, c.contentHash);
+          if (result) {
+            processed++;
+            await saveIngestCache(cache);
+          } else {
+            failed++;
+          }
+        } catch (err) {
+          failed++;
+          console.log(`  Error processing ${c.relativePath}: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+    });
+    await Promise.all(workers);
+  } else {
+    for (let i = 0; i < toProcess.length; i++) {
+      const c = toProcess[i]!;
+      console.log(`\n[${i + 1}/${toProcess.length}] Ingesting: ${c.relativePath}`);
+      try {
+        const result = await ingestSingleInternal(c.absolutePath, cache, c.contentHash);
+        if (result) {
+          processed++;
+          await saveIngestCache(cache);
+        } else {
+          failed++;
+        }
+      } catch (err) {
+        failed++;
+        console.log(`  Error processing ${c.relativePath}: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }
+
+  await saveIngestCache(cache);
+
+  console.log(`\nBatch complete. Processed: ${processed}, Failed: ${failed}, Skipped: ${skipped.length}`);
+}
+
+/** @deprecated Use ingestSingle instead */
+export const ingest = ingestSingle;

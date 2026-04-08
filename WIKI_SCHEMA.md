@@ -108,3 +108,28 @@ grep "^## \[" wiki/log.md | tail -10
 ```
 
 Operations: `ingest`, `query`, `lint`, `graph`
+
+---
+
+## Ingest Cache
+
+File: `wiki/.ingest-cache.json`
+
+Tracks which source files have been ingested to enable idempotent batch processing.
+
+```jsonc
+{
+  "version": 1,
+  "entries": {
+    "raw/papers/attention.md": {
+      "content_hash": "a1b2c3d4e5f6g7h8",  // SHA256 first 16 hex chars
+      "slug": "attention-is-all-you-need",
+      "source_page": "wiki/sources/attention-is-all-you-need.md",
+      "ingested_at": "2026-04-08T10:30:00Z",
+      "title": "Attention Is All You Need"
+    }
+  }
+}
+```
+
+**Cache logic:** A file is skipped if (1) it has a cache entry, (2) the content hash matches, and (3) the output source page still exists. Use `--force` to bypass.

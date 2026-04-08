@@ -25,46 +25,118 @@ pnpm install
 ### wiki-ingest — 摄入源文档
 
 ```bash
-pnpm dev:ingest <source>
+pnpm dev:ingest [source] [options]
 ```
 
 **参数：**
 
 | 参数 | 必填 | 说明 |
 |---|---|---|
-| `<source>` | 是 | 源文件路径（相对或绝对路径） |
+| `[source]` | 否 | 源文件路径（省略则扫描 raw/ 目录进行批量处理） |
+
+**选项：**
+
+| 选项 | 说明 |
+|---|---|
+| `--force` | 强制重新 ingest，忽略缓存 |
+| `--dry-run` | 仅预览哪些文件会被处理，不执行 |
+| `--clean` | 清除 ingest 缓存并退出 |
+| `--status` | 显示所有文件的缓存状态并退出 |
+| `--concurrency <n>` | 批量模式下的并行 worker 数（默认 1） |
 
 **示例：**
 
 ```bash
-# 摄入单个文件
-pnpm dev:ingest raw/articles/my-article.md
+# 批量模式 — 扫描 raw/ 目录，自动跳过已处理文件
+pnpm dev:ingest
 
-# 使用绝对路径
-pnpm dev:ingest /path/to/document.md
+# 单文件模式 — 指定文件，有缓存则跳过
+pnpm dev:ingest raw/papers/attention.md
+
+# 单文件 + 强制重新处理
+pnpm dev:ingest raw/papers/attention.md --force
+
+# 批量 + 强制全部重新处理
+pnpm dev:ingest --force
+
+# 预览模式 — 查看哪些文件会被处理
+pnpm dev:ingest --dry-run
+
+# 预览 + 强制 — 查看如果全部重新处理会有哪些
+pnpm dev:ingest --dry-run --force
+
+# 查看缓存状态
+pnpm dev:ingest --status
+
+# 清除缓存
+pnpm dev:ingest --clean
+
+# 并行批量处理 (3 个 worker)
+pnpm dev:ingest --concurrency 3
 
 # 编译后运行
 pnpm build
 node dist/cli/ingest.js raw/articles/my-article.md
 ```
 
-**输出：**
+**批量模式输出示例：**
 
 ```
-Ingesting: my-article.md  (hash: a1b2c3d4e5f6g7h8)
+Scan complete: 5 files found
+  To process: 2
+  Skipped:    3
+    [+NEW] raw/papers/new-paper.md
+    [~CHANGED] raw/articles/updated-article.md
+
+[1/2] Ingesting: raw/papers/new-paper.md
   calling Claude API...
-  wrote: wiki/sources/my-article.md
-  wrote: wiki/entities/OpenAI.md
-  wrote: wiki/concepts/MachineLearning.md
+  wrote: wiki/sources/new-paper.md
+  wrote: wiki/entities/SomeEntity.md
   wrote: wiki/index.md
   wrote: wiki/log.md
+Done. Ingested: New Paper Title
 
-Done. Ingested: My Article Title
+[2/2] Ingesting: raw/articles/updated-article.md
+  calling Claude API...
+  wrote: wiki/sources/updated-article.md
+  wrote: wiki/index.md
+  wrote: wiki/log.md
+Done. Ingested: Updated Article Title
+
+Batch complete. Processed: 2, Failed: 0, Skipped: 3
+```
+
+**--status 输出示例：**
+
+```
+Ingest cache: 3 entries
+
+  Status  | Path                                    | Title
+  --------|-----------------------------------------|------
+  CACHED  | raw/papers/attention.md                 | Attention Is All You Need
+  CHANGED | raw/articles/rag-survey.md              | RAG Survey
+  CACHED  | raw/papers/bert.md                      | BERT
+
+  Not cached (1):
+    [NEW]     raw/papers/new-paper.md
+```
+
+**Dry-run 输出示例：**
+
+```
+Scan complete: 5 files found
+  To process: 2
+  Skipped:    3
+    [+NEW] raw/papers/new-paper.md
+    [~CHANGED] raw/articles/updated-article.md
+
+--dry-run: no files were processed.
 ```
 
 **错误处理：**
 - 源文件不存在 → 退出码 1
 - API 响应解析失败 → 保存原始响应到 `.debug/ingest_debug.txt`
+- 批量模式单文件失败 → 继续处理下一个文件
 
 ---
 

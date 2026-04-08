@@ -6,28 +6,34 @@
 
 ## 1. Ingest — 知识摄入
 
-将源文档转化为结构化的 wiki 页面。
+将源文档转化为结构化的 wiki 页面。支持单文件和批量两种模式，基于 SHA256 内容哈希的缓存机制确保幂等性。
 
 ### 触发方式
 
 | IDE | 触发方式 |
 |---|---|
-| Claude Code | `/wiki-ingest raw/file.md` 或 `ingest raw/file.md` |
-| Cursor | `ingest raw/file.md` |
-| Codex | `ingest raw/file.md` |
-| Antigravity | `ingest raw/file.md` |
-| CLI | `pnpm dev:ingest raw/file.md` |
+| Claude Code | `/wiki-ingest raw/file.md` 或 `ingest` (批量) |
+| Cursor | `ingest raw/file.md` 或 `ingest` (批量) |
+| Codex | `ingest raw/file.md` 或 `ingest` (批量) |
+| Antigravity | `ingest raw/file.md` 或 `ingest` (批量) |
+| CLI | `pnpm dev:ingest [source] [options]` |
 
-### 执行流程
+### 执行流程（单文件模式）
 
 ```
-输入: 源文件路径 (string)
+输入: 源文件路径 (string), 可选 --force
   │
   ▼
-1. 验证源文件存在
+1. 加载 wiki/.ingest-cache.json
   │
   ▼
-2. 读取源文件 + 计算 SHA256
+2. 缓存判定
+   ├── 计算文件 SHA256
+   ├── 无缓存记录 → NEW
+   ├── 哈希不匹配 → CHANGED
+   ├── 输出文件缺失 → OUTPUT_MISSING
+   ├── 完全匹配 → CACHED (跳过)
+   └── --force → FORCED (强制处理)
   │
   ▼
 3. 构建 Wiki 上下文
@@ -57,30 +63,84 @@
    └── wiki/log.md                (追加日志)
   │
   ▼
-8. 报告矛盾 (如有)
+8. 更新 wiki/.ingest-cache.json
+  │
+  ▼
+9. 报告矛盾 (如有)
   │
   ▼
 输出: 完成摘要
 ```
 
+### 执行流程（批量模式）
+
+```
+输入: 无参数, 可选 --force --dry-run --concurrency <n>
+  │
+  ▼
+1. 递归扫描 raw/ 目录 (.md, .txt 文件)
+  │
+  ▼
+2. 加载 wiki/.ingest-cache.json
+  │
+  ▼
+3. 清理过期缓存条目 (源文件已删除的)
+  │
+  ▼
+4. 对每个文件执行缓存判定
+  │
+  ▼
+5. 输出扫描摘要
+   ├── 总文件数
+   ├── 需处理数 (按状态分类)
+   └── 跳过数
+  │
+  ▼
+6. --dry-run → 到此结束
+  │
+  ▼
+7. 逐个（或并行）执行 ingest
+   ├── 每个文件成功后更新缓存到磁盘
+   └── 失败不中断批量流程
+  │
+  ▼
+输出: 批量完成摘要 (processed / failed / skipped)
+```
+
+### 缓存判定逻辑
+
+| 状态 | 含义 | 处理 |
+|------|------|------|
+| `NEW` | 缓存中无记录，首次处理 | 执行 ingest |
+| `CHANGED` | 源文件内容已变化 | 重新 ingest |
+| `OUTPUT_MISSING` | 源文件未变但输出被删除 | 重新 ingest |
+| `CACHED` | 完全匹配，跳过 | 打印跳过消息 |
+| `FORCED` | 用户强制重新处理 | 无条件执行 |
+
 ### Agent 模式步骤
 
 Agent 模式（非 CLI）时，Agent 自己执行以下步骤：
 
-1. **读取源文件** — 使用 Read 工具读取 `raw/` 中的文件
-2. **读取上下文** — 读取 `wiki/index.md` 和 `wiki/overview.md`
-3. **写入 source page** — 在 `wiki/sources/` 中创建 `<slug>.md`
-4. **更新 index** — 在 `wiki/index.md` 的 Sources 部分添加条目
-5. **更新 overview** — 如有需要，修订 `wiki/overview.md` 的综合描述
-6. **创建/更新 entity pages** — 在 `wiki/entities/` 中创建关键人物、公司、项目的页面
-7. **创建/更新 concept pages** — 在 `wiki/concepts/` 中创建关键概念、框架的页面
-8. **报告矛盾** — 如与现有 wiki 内容有矛盾，标记出来
-9. **追加日志** — 在 `wiki/log.md` 中追加操作记录
+**单文件:**
+1. 读取 `wiki/.ingest-cache.json`，计算源文件 SHA256
+2. 检查缓存，决定是否跳过
+3. **读取源文件** — 使用 Read 工具读取 `raw/` 中的文件
+4. **读取上下文** — 读取 `wiki/index.md` 和 `wiki/overview.md`
+5. **写入 source page** — 在 `wiki/sources/` 中创建 `<slug>.md`
+6. **更新 index** — 在 `wiki/index.md` 的 Sources 部分添加条目
+7. **更新 overview** — 如有需要，修订 `wiki/overview.md`
+8. **创建/更新 entity pages** — 在 `wiki/entities/` 中创建关键人物、公司、项目的页面
+9. **创建/更新 concept pages** — 在 `wiki/concepts/` 中创建关键概念、框架的页面
+10. **报告矛盾** — 如与现有 wiki 内容有矛盾，标记出来
+11. **追加日志** — 在 `wiki/log.md` 中追加操作记录
+12. **更新缓存** — 更新 `wiki/.ingest-cache.json`
+
+**批量:** 先扫描 `raw/`、加载缓存、报告状态，然后对需要处理的文件逐个执行上述步骤。
 
 ### 源文件要求
 
 - 放在 `raw/` 目录下（raw 目录是不可变的，agent 不会修改）
-- 格式：Markdown (.md)
+- 格式：Markdown (.md) 或纯文本 (.txt)
 - 内容：任何文本类的源文档（论文、文章、笔记、报告等）
 
 ### 产出示例
@@ -98,7 +158,8 @@ wiki/
 │   └── SelfAttention.md                   # 新建或更新
 ├── index.md                               # 更新：添加新条目
 ├── overview.md                            # 更新：修订综合描述
-└── log.md                                 # 更新：追加日志
+├── log.md                                 # 更新：追加日志
+└── .ingest-cache.json                     # 更新：记录缓存条目
 ```
 
 ---
@@ -306,7 +367,8 @@ Graph 工作流使用 SHA256 缓存机制（`graph/.cache.json`）：
 
 | 维度 | Ingest | Query | Lint | Graph |
 |---|---|---|---|---|
-| 输入 | 源文件路径 | 问题 | 无 | 无 |
-| API 调用 | 1 (Sonnet) | 1-2 (Haiku + Sonnet) | 1 (Sonnet) | 0-N (Haiku per page) |
-| 写入文件 | 多个 wiki 页面 | 可选 synthesis | 可选 lint-report | graph.json + graph.html |
-| 幂等性 | 否（每次追加新条目） | 是（同问题可重复查询） | 是 | 是（相同内容不重复推断） |
+| 输入 | 源文件路径（可选） | 问题 | 无 | 无 |
+| API 调用 | 1 (Sonnet) per file | 1-2 (Haiku + Sonnet) | 1 (Sonnet) | 0-N (Haiku per page) |
+| 写入文件 | 多个 wiki 页面 + 缓存 | 可选 synthesis | 可选 lint-report | graph.json + graph.html |
+| 幂等性 | 是（基于内容哈希缓存） | 是（同问题可重复查询） | 是 | 是（相同内容不重复推断） |
+| 批量模式 | 是（自动扫描 raw/） | 否 | 否 | 否 |

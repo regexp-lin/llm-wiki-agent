@@ -6,12 +6,14 @@ This wiki is maintained entirely by your coding agent. No API key or Node.js scr
 
 Describe what you want in plain English:
 - *"Ingest this file: raw/papers/my-paper.md"*
+- *"Ingest all new files"* (batch mode)
 - *"What does the wiki say about transformer models?"*
 - *"Check the wiki for orphan pages and contradictions"*
 - *"Build the knowledge graph"*
 
 Or use shorthand triggers:
-- `ingest <file>` → runs the Ingest Workflow
+- `ingest <file>` → runs the Ingest Workflow (single file)
+- `ingest` → runs the Ingest Workflow (batch mode)
 - `query: <question>` → runs the Query Workflow
 - `lint` → runs the Lint Workflow
 - `build graph` → runs the Graph Workflow
@@ -24,18 +26,35 @@ Read `WIKI_SCHEMA.md` at the project root for the full wiki data model: director
 
 ## Ingest Workflow
 
+### Single File Mode
+
 Triggered by: *"ingest <file>"*
 
 Steps (in order):
-1. Read the source document fully
-2. Read `wiki/index.md` and `wiki/overview.md` for current wiki context
-3. Write `wiki/sources/<slug>.md` — use the source page format defined in WIKI_SCHEMA.md
-4. Update `wiki/index.md` — add entry under Sources section
-5. Update `wiki/overview.md` — revise synthesis if warranted
-6. Update/create entity pages for key people, companies, projects mentioned
-7. Update/create concept pages for key ideas and frameworks discussed
-8. Flag any contradictions with existing wiki content
-9. Append to `wiki/log.md`: `## [YYYY-MM-DD] ingest | <Title>`
+1. Read `wiki/.ingest-cache.json` and compute the source file's SHA256
+2. Check cache: if file is cached and output exists, skip it
+3. Read the source document fully
+4. Read `wiki/index.md` and `wiki/overview.md` for current wiki context
+5. Write `wiki/sources/<slug>.md` — use the source page format defined in WIKI_SCHEMA.md
+6. Update `wiki/index.md` — add entry under Sources section
+7. Update `wiki/overview.md` — revise synthesis if warranted
+8. Update/create entity pages for key people, companies, projects mentioned
+9. Update/create concept pages for key ideas and frameworks discussed
+10. Flag any contradictions with existing wiki content
+11. Append to `wiki/log.md`: `## [YYYY-MM-DD] ingest | <Title>`
+12. Update `wiki/.ingest-cache.json` with the new entry
+
+### Batch Mode
+
+Triggered by: *"ingest"* (no file argument)
+
+Steps:
+1. Scan `raw/` directory recursively for all `.md` and `.txt` files
+2. Read `wiki/.ingest-cache.json`
+3. Classify each file: NEW / CHANGED / OUTPUT_MISSING / CACHED
+4. Report scan results
+5. For each file needing processing, execute single-file ingest
+6. Update cache after each successful ingest
 
 ---
 
@@ -85,9 +104,16 @@ If Node.js/deps unavailable, build manually:
 ## CLI Quick Reference
 
 ```bash
-pnpm install                       # install dependencies
-pnpm dev:ingest raw/my-article.md  # ingest via CLI (needs ANTHROPIC_API_KEY)
-pnpm dev:query "question"          # query via CLI
-pnpm dev:lint                      # lint via CLI
-pnpm dev:graph --open              # build graph + open in browser
+pnpm install                          # install dependencies
+pnpm dev:ingest                       # batch ingest — scan raw/, skip cached
+pnpm dev:ingest raw/my-article.md     # single file ingest
+pnpm dev:ingest --force               # re-ingest all files
+pnpm dev:ingest raw/file.md --force   # force re-ingest single file
+pnpm dev:ingest --dry-run             # preview what would be processed
+pnpm dev:ingest --status              # show cache status
+pnpm dev:ingest --clean               # clear ingest cache
+pnpm dev:ingest --concurrency 3       # parallel batch ingest
+pnpm dev:query "question"             # query via CLI
+pnpm dev:lint                         # lint via CLI
+pnpm dev:graph --open                 # build graph + open in browser
 ```
