@@ -53,10 +53,12 @@ export async function pageNameToPath(name: string): Promise<string[]> {
   });
 }
 
-export async function buildPageNameMap(): Promise<Map<string, string[]>> {
-  const pages = await allWikiPages();
+export async function buildPageNameMap(
+  pages?: string[],
+): Promise<Map<string, string[]>> {
+  const resolvedPages = pages ?? (await allWikiPages());
   const nameMap = new Map<string, string[]>();
-  for (const p of pages) {
+  for (const p of resolvedPages) {
     const stem = path.basename(p, ".md").toLowerCase();
     const existing = nameMap.get(stem) ?? [];
     existing.push(p);

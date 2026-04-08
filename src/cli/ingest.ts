@@ -4,6 +4,7 @@ import { Command } from "commander";
 import { ingestSingle, ingestBatch } from "../workflows/ingest.js";
 import { loadIngestCache, clearIngestCache, getCacheStats, scanRawDirectory, classifyFile } from "../shared/ingest-cache.js";
 import { REPO_ROOT } from "../shared/constants.js";
+import { WikiError } from "../shared/errors.js";
 
 const program = new Command();
 program
@@ -22,26 +23,35 @@ program
     status?: boolean;
     concurrency?: string;
   }) => {
-    if (opts.clean) {
-      await clearIngestCache();
-      return;
-    }
+    try {
+      if (opts.clean) {
+        await clearIngestCache();
+        return;
+      }
 
-    if (opts.status) {
-      await showStatus();
-      return;
-    }
+      if (opts.status) {
+        await showStatus();
+        return;
+      }
 
-    const concurrency = parseInt(opts.concurrency ?? "1", 10);
+      const parsed = parseInt(opts.concurrency ?? "1", 10);
+      const concurrency = Number.isFinite(parsed) && parsed >= 1 ? parsed : 1;
 
-    if (source) {
-      await ingestSingle(source, { force: opts.force ?? false });
-    } else {
-      await ingestBatch({
-        force: opts.force ?? false,
-        dryRun: opts.dryRun ?? false,
-        concurrency,
-      });
+      if (source) {
+        await ingestSingle(source, { force: opts.force ?? false });
+      } else {
+        await ingestBatch({
+          force: opts.force ?? false,
+          dryRun: opts.dryRun ?? false,
+          concurrency,
+        });
+      }
+    } catch (error) {
+      if (error instanceof WikiError) {
+        console.error(`Error: ${error.message}`);
+        process.exit(1);
+      }
+      throw error;
     }
   });
 

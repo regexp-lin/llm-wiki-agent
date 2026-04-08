@@ -1,12 +1,17 @@
 import path from "node:path";
 
 import { REPO_ROOT, WIKI_DIR, OVERVIEW_FILE, MODEL_SONNET } from "../shared/constants.js";
-import { readFile, writeFile, appendLog } from "../shared/file-utils.js";
+import { writeFile, appendLog, readFilesParallel } from "../shared/file-utils.js";
 import { allWikiPages, extractWikilinks, buildPageNameMap } from "../shared/wiki-utils.js";
-import { getClient } from "../shared/llm-utils.js";
+import { callLlm } from "../shared/llm-utils.js";
+import { usageTracker } from "../shared/usage-tracker.js";
 import type { BrokenLink } from "../shared/types.js";
 
-export function findOrphans(pages: string[], nameMap: Map<string, string[]>): string[] {
+export function findOrphans(
+  pages: string[],
+  contents: Map<string, string>,
+  nameMap: Map<string, string[]>,
+): string[] {
   const inbound = new Map<string, number>();
 
   for (const p of pages) {
@@ -14,7 +19,7 @@ export function findOrphans(pages: string[], nameMap: Map<string, string[]>): st
   }
 
   for (const p of pages) {
-    const content = readFileSync(p);
+    const content = contents.get(p) ?? "";
     const links = extractWikilinks(content);
     for (const link of links) {
       const resolved = nameMap.get(link.toLowerCase()) ?? [];
@@ -29,11 +34,15 @@ export function findOrphans(pages: string[], nameMap: Map<string, string[]>): st
   );
 }
 
-export function findBrokenLinks(pages: string[], nameMap: Map<string, string[]>): BrokenLink[] {
+export function findBrokenLinks(
+  pages: string[],
+  contents: Map<string, string>,
+  nameMap: Map<string, string[]>,
+): BrokenLink[] {
   const broken: BrokenLink[] = [];
 
   for (const p of pages) {
-    const content = readFileSync(p);
+    const content = contents.get(p) ?? "";
     const links = extractWikilinks(content);
     for (const link of links) {
       const resolved = nameMap.get(link.toLowerCase());
@@ -49,12 +58,16 @@ export function findBrokenLinks(pages: string[], nameMap: Map<string, string[]>)
   return broken;
 }
 
-export function findMissingEntities(pages: string[], nameMap: Map<string, string[]>): string[] {
+export function findMissingEntities(
+  pages: string[],
+  contents: Map<string, string>,
+  nameMap: Map<string, string[]>,
+): string[] {
   const mentionCounts = new Map<string, number>();
   const existingPages = new Set([...nameMap.keys()]);
 
   for (const p of pages) {
-    const content = readFileSync(p);
+    const content = contents.get(p) ?? "";
     const links = extractWikilinks(content);
     for (const link of links) {
       if (!existingPages.has(link.toLowerCase())) {
@@ -63,25 +76,7 @@ export function findMissingEntities(pages: string[], nameMap: Map<string, string
     }
   }
 
-  return [...mentionCounts.entries()].filter(([_, count]) => count >= 3).map(([name]) => name);
-}
-
-// Cache for synchronous reads within a single lint run
-const fileCache = new Map<string, string>();
-
-function readFileSync(filePath: string): string {
-  const cached = fileCache.get(filePath);
-  if (cached !== undefined) return cached;
-  // Will be populated during the async phase
-  return "";
-}
-
-async function preloadFiles(pages: string[]): Promise<void> {
-  fileCache.clear();
-  for (const p of pages) {
-    const content = await readFile(p);
-    fileCache.set(p, content);
-  }
+  return [...mentionCounts.entries()].filter(([, count]) => count >= 3).map(([name]) => name);
 }
 
 export async function runLint(save?: boolean): Promise<string> {
@@ -95,40 +90,35 @@ export async function runLint(save?: boolean): Promise<string> {
 
   console.log(`Linting ${pages.length} wiki pages...`);
 
-  // Pre-load all file contents
-  await preloadFiles(pages);
+  const contents = await readFilesParallel(pages);
+  const nameMap = await buildPageNameMap(pages);
 
-  // Build name→path mapping
-  const nameMap = await buildPageNameMap();
-
-  // Deterministic checks
-  const orphans = findOrphans(pages, nameMap);
-  const broken = findBrokenLinks(pages, nameMap);
-  const missingEntities = findMissingEntities(pages, nameMap);
+  const orphans = findOrphans(pages, contents, nameMap);
+  const broken = findBrokenLinks(pages, contents, nameMap);
+  const missingEntities = findMissingEntities(pages, contents, nameMap);
 
   console.log(`  orphans: ${orphans.length}`);
   console.log(`  broken links: ${broken.length}`);
   console.log(`  missing entity pages: ${missingEntities.length}`);
 
-  // Build context for semantic checks
   const sample = pages.slice(0, 20);
   let pagesContext = "";
   for (const p of sample) {
     const rel = path.relative(REPO_ROOT, p);
-    const content = fileCache.get(p) ?? "";
+    const content = contents.get(p) ?? "";
     pagesContext += `\n\n### ${rel}\n${content.slice(0, 1500)}`;
   }
 
-  const client = getClient();
   console.log("  running semantic lint via Claude API...");
 
-  const response = await client.messages.create({
-    model: MODEL_SONNET,
-    max_tokens: 3000,
-    messages: [
-      {
-        role: "user",
-        content: `You are linting an LLM Wiki. Review the pages below and identify:
+  const response = await callLlm(
+    {
+      model: MODEL_SONNET,
+      max_tokens: 3000,
+      messages: [
+        {
+          role: "user",
+          content: `You are linting an LLM Wiki. Review the pages below and identify:
 1. Contradictions between pages (claims that conflict)
 2. Stale content (summaries that newer sources have superseded)
 3. Data gaps (important questions the wiki can't answer — suggest specific sources to find)
@@ -145,14 +135,15 @@ Return a markdown lint report with these sections:
 
 Be specific — name the exact pages and claims involved.
 `,
-      },
-    ],
-  });
+        },
+      ],
+    },
+    { workflow: "lint" },
+  );
 
   const firstBlock = response.content[0];
   const semanticReport = firstBlock?.type === "text" ? firstBlock.text : "";
 
-  // Compose full report
   const reportLines: string[] = [
     `# Wiki Lint Report — ${today}`,
     "",
@@ -203,12 +194,12 @@ Be specific — name the exact pages and claims involved.
     await writeFile(reportPath, report);
   }
 
-  await appendLog(
-    `## [${today}] lint | Wiki health check\n\nRan lint. See lint-report.md for details.`,
-  );
+  const logMsg = save
+    ? `## [${today}] lint | Wiki health check\n\nRan lint. See lint-report.md for details.`
+    : `## [${today}] lint | Wiki health check\n\nRan lint on ${pages.length} pages.`;
+  await appendLog(logMsg);
 
-  // Clear cache
-  fileCache.clear();
+  usageTracker.printSummary();
 
   return report;
 }

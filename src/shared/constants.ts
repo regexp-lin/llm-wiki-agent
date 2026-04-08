@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export const REPO_ROOT = path.resolve(__dirname, "../..");
+export const REPO_ROOT = process.env.WIKI_ROOT ?? path.resolve(__dirname, "../..");
 export const WIKI_DIR = path.join(REPO_ROOT, "wiki");
 export const GRAPH_DIR = path.join(REPO_ROOT, "graph");
 export const RAW_DIR = path.join(REPO_ROOT, "raw");
@@ -27,6 +27,14 @@ export const TYPE_COLORS: Record<string, string> = {
   concept: "#FF9800",
   synthesis: "#9C27B0",
   unknown: "#9E9E9E",
+};
+
+export const TYPE_SHAPES: Record<string, string> = {
+  source: "diamond",
+  entity: "dot",
+  concept: "triangle",
+  synthesis: "star",
+  unknown: "square",
 };
 
 export const EDGE_COLORS: Record<string, string> = {

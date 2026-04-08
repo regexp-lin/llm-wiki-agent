@@ -1,25 +1,35 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import crypto from "node:crypto";
 import { REPO_ROOT, RAW_DIR, INGEST_CACHE_FILE, WIKI_DIR, SUPPORTED_EXTENSIONS } from "./constants.js";
 import { fileExists } from "./file-utils.js";
+import { sha256Short } from "./crypto-utils.js";
 import type { IngestCache, IngestCacheEntry, IngestCandidate, IngestFileStatus } from "./types.js";
 
 const CACHE_VERSION = 1;
 
-export function sha256(text: string): string {
-  return crypto.createHash("sha256").update(text).digest("hex").slice(0, 16);
-}
+/** @deprecated Use sha256Short from crypto-utils instead */
+export const sha256 = sha256Short;
 
 export async function loadIngestCache(): Promise<IngestCache> {
   try {
     const raw = await fs.readFile(INGEST_CACHE_FILE, "utf-8");
-    const parsed = JSON.parse(raw) as IngestCache;
-    if (parsed.version !== CACHE_VERSION) {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      !("version" in parsed) ||
+      !("entries" in parsed) ||
+      typeof (parsed as Record<string, unknown>).entries !== "object"
+    ) {
+      console.log("  warning: cache file corrupted, starting fresh");
+      return { version: CACHE_VERSION, entries: {} };
+    }
+    const cache = parsed as IngestCache;
+    if (cache.version !== CACHE_VERSION) {
       console.log("  warning: cache version mismatch, starting fresh");
       return { version: CACHE_VERSION, entries: {} };
     }
-    return parsed;
+    return cache;
   } catch {
     return { version: CACHE_VERSION, entries: {} };
   }
@@ -27,9 +37,14 @@ export async function loadIngestCache(): Promise<IngestCache> {
 
 export async function saveIngestCache(cache: IngestCache): Promise<void> {
   await fs.mkdir(path.dirname(INGEST_CACHE_FILE), { recursive: true });
-  const tmpFile = INGEST_CACHE_FILE + ".tmp";
-  await fs.writeFile(tmpFile, JSON.stringify(cache, null, 2), "utf-8");
-  await fs.rename(tmpFile, INGEST_CACHE_FILE);
+  const tmpFile = INGEST_CACHE_FILE + `.tmp.${process.pid}.${Date.now()}`;
+  try {
+    await fs.writeFile(tmpFile, JSON.stringify(cache, null, 2), "utf-8");
+    await fs.rename(tmpFile, INGEST_CACHE_FILE);
+  } catch (error) {
+    try { await fs.unlink(tmpFile); } catch { /* ignore cleanup */ }
+    throw error;
+  }
 }
 
 export async function clearIngestCache(): Promise<void> {
@@ -69,7 +84,7 @@ export async function classifyFile(
 ): Promise<IngestCandidate> {
   const relativePath = path.relative(REPO_ROOT, absolutePath);
   const content = await fs.readFile(absolutePath, "utf-8");
-  const currentHash = sha256(content);
+  const currentHash = sha256Short(content);
 
   if (force) {
     return { relativePath, absolutePath, status: "FORCED", contentHash: currentHash, cachedEntry: cache.entries[relativePath] };

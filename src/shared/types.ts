@@ -50,6 +50,9 @@ export interface GraphNode {
   color: string;
   path: string;
   group?: number;
+  shape?: string;
+  borderColor?: string;
+  borderWidth?: number;
 }
 
 export interface GraphEdge {

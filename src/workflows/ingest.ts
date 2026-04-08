@@ -11,9 +11,9 @@ import {
   MODEL_SONNET,
 } from "../shared/constants.js";
 import { readFile, writeFile, appendLog } from "../shared/file-utils.js";
-import { getClient, parseJsonFromResponse } from "../shared/llm-utils.js";
+import { callLlm, parseJsonFromResponse } from "../shared/llm-utils.js";
+import { sha256Short } from "../shared/crypto-utils.js";
 import {
-  sha256,
   loadIngestCache,
   saveIngestCache,
   scanRawDirectory,
@@ -22,7 +22,13 @@ import {
   removeStaleCacheEntries,
   formatStatus,
 } from "../shared/ingest-cache.js";
-import type { IngestResult, IngestCandidate, IngestCache, PageUpdate, IngestBatchOptions } from "../shared/types.js";
+import { IngestResultSchema } from "../shared/validators.js";
+import { fitPagesIntoBudget } from "../shared/context-manager.js";
+import { Semaphore } from "../shared/semaphore.js";
+import { ProgressTracker } from "../shared/progress.js";
+import { WikiError, WikiErrorCode } from "../shared/errors.js";
+import { usageTracker } from "../shared/usage-tracker.js";
+import type { IngestResult, IngestCache, IngestBatchOptions } from "../shared/types.js";
 
 async function buildWikiContext(): Promise<string> {
   const parts: string[] = [];
@@ -53,9 +59,21 @@ async function buildWikiContext(): Promise<string> {
     withMtime.sort((a, b) => b.mtime - a.mtime);
     const recent = withMtime.slice(0, 5);
 
-    for (const { fullPath } of recent) {
-      const content = await fs.readFile(fullPath, "utf-8");
-      parts.push(`## ${path.relative(REPO_ROOT, fullPath)}\n${content}`);
+    const recentPages = await Promise.all(
+      recent.map(async ({ fullPath }) => ({
+        path: path.relative(REPO_ROOT, fullPath),
+        content: await fs.readFile(fullPath, "utf-8"),
+      })),
+    );
+
+    const fitted = fitPagesIntoBudget(recentPages, {
+      maxTotalTokens: 40000,
+      reservedForOutput: 0,
+      reservedForPromptFrame: 0,
+    });
+
+    for (const page of fitted) {
+      parts.push(`## ${page.path}\n${page.content}`);
     }
   } catch {
     // sources/ dir may not exist yet
@@ -80,10 +98,52 @@ async function updateIndex(newEntry: string, section: string = "Sources"): Promi
   await writeFile(INDEX_FILE, content);
 }
 
-function isIngestResult(data: unknown): data is IngestResult {
-  if (typeof data !== "object" || data === null) return false;
-  const d = data as Record<string, unknown>;
-  return typeof d.slug === "string" && typeof d.source_page === "string";
+interface WriteOperation {
+  path: string;
+  content: string;
+}
+
+class IngestTransaction {
+  private writes: WriteOperation[] = [];
+  private backups: Map<string, string | null> = new Map();
+
+  record(filePath: string, content: string): void {
+    this.writes.push({ path: filePath, content });
+  }
+
+  async commit(): Promise<void> {
+    for (const { path: filePath } of this.writes) {
+      try {
+        const existing = await fs.readFile(filePath, "utf-8");
+        this.backups.set(filePath, existing);
+      } catch {
+        this.backups.set(filePath, null);
+      }
+    }
+
+    try {
+      for (const { path: filePath, content } of this.writes) {
+        await writeFile(filePath, content);
+      }
+    } catch (error) {
+      await this.rollback();
+      throw error;
+    }
+  }
+
+  private async rollback(): Promise<void> {
+    for (const [filePath, backup] of this.backups) {
+      try {
+        if (backup === null) {
+          await fs.unlink(filePath);
+        } else {
+          await fs.writeFile(filePath, backup, "utf-8");
+        }
+      } catch {
+        // best-effort rollback
+      }
+    }
+  }
 }
 
 async function ingestSingleInternal(
@@ -92,7 +152,7 @@ async function ingestSingleInternal(
   precomputedHash?: string,
 ): Promise<{ slug: string; title: string; contentHash: string } | null> {
   const sourceContent = await fs.readFile(absolutePath, "utf-8");
-  const sourceHash = precomputedHash ?? sha256(sourceContent);
+  const sourceHash = precomputedHash ?? sha256Short(sourceContent);
   const today = new Date().toISOString().slice(0, 10);
   const sourceName = path.basename(absolutePath);
   const relPath = absolutePath.startsWith(REPO_ROOT)
@@ -137,13 +197,15 @@ Return ONLY a valid JSON object with these fields (no markdown fences, no prose 
 }`;
 
   console.log("  calling Claude API...");
-  const client = getClient();
 
-  const response = await client.messages.create({
-    model: MODEL_SONNET,
-    max_tokens: 8192,
-    messages: [{ role: "user", content: prompt }],
-  });
+  const response = await callLlm(
+    {
+      model: MODEL_SONNET,
+      max_tokens: 8192,
+      messages: [{ role: "user", content: prompt }],
+    },
+    { workflow: "ingest" },
+  );
 
   const firstBlock = response.content[0];
   if (!firstBlock || firstBlock.type !== "text") {
@@ -155,10 +217,11 @@ Return ONLY a valid JSON object with these fields (no markdown fences, no prose 
   let data: IngestResult;
   try {
     const parsed = parseJsonFromResponse(raw);
-    if (!isIngestResult(parsed)) {
-      throw new Error("Response missing required fields");
+    const validationResult = IngestResultSchema.safeParse(parsed);
+    if (!validationResult.success) {
+      throw new Error(`Validation error: ${validationResult.error.message}`);
     }
-    data = parsed;
+    data = validationResult.data;
   } catch (e) {
     console.log(`Error parsing API response: ${e instanceof Error ? e.message : e}`);
     const debugDir = path.join(REPO_ROOT, ".debug");
@@ -169,27 +232,27 @@ Return ONLY a valid JSON object with these fields (no markdown fences, no prose 
     return null;
   }
 
-  await writeFile(path.join(WIKI_DIR, "sources", `${data.slug}.md`), data.source_page);
+  const tx = new IngestTransaction();
+  tx.record(path.join(WIKI_DIR, "sources", `${data.slug}.md`), data.source_page);
 
-  for (const page of data.entity_pages ?? []) {
-    await writeFile(path.join(WIKI_DIR, (page as PageUpdate).path), (page as PageUpdate).content);
+  for (const page of data.entity_pages) {
+    tx.record(path.join(WIKI_DIR, page.path), page.content);
   }
-
-  for (const page of data.concept_pages ?? []) {
-    await writeFile(path.join(WIKI_DIR, (page as PageUpdate).path), (page as PageUpdate).content);
+  for (const page of data.concept_pages) {
+    tx.record(path.join(WIKI_DIR, page.path), page.content);
   }
-
   if (data.overview_update) {
-    await writeFile(OVERVIEW_FILE, data.overview_update);
+    tx.record(OVERVIEW_FILE, data.overview_update);
   }
+
+  await tx.commit();
 
   await updateIndex(data.index_entry, "Sources");
   await appendLog(data.log_entry);
 
-  const contradictions = data.contradictions ?? [];
-  if (contradictions.length > 0) {
+  if (data.contradictions.length > 0) {
     console.log("\n  Contradictions detected:");
-    for (const c of contradictions) {
+    for (const c of data.contradictions) {
       console.log(`     - ${c}`);
     }
   }
@@ -208,8 +271,11 @@ export async function ingestSingle(sourcePath: string, opts?: { force?: boolean 
   try {
     await fs.access(resolvedPath);
   } catch {
-    console.log(`Error: file not found: ${sourcePath}`);
-    process.exit(1);
+    throw new WikiError(
+      `File not found: ${sourcePath}`,
+      WikiErrorCode.FILE_NOT_FOUND,
+      { sourcePath },
+    );
   }
 
   const cache = await loadIngestCache();
@@ -226,6 +292,8 @@ export async function ingestSingle(sourcePath: string, opts?: { force?: boolean 
   if (result) {
     await saveIngestCache(cache);
   }
+
+  usageTracker.printSummary();
 }
 
 export async function ingestBatch(opts?: IngestBatchOptions): Promise<void> {
@@ -247,10 +315,9 @@ export async function ingestBatch(opts?: IngestBatchOptions): Promise<void> {
     console.log(`  Removed ${staleRemoved} stale cache entries (source files deleted).`);
   }
 
-  const candidates: IngestCandidate[] = [];
-  for (const f of files) {
-    candidates.push(await classifyFile(f, cache, force));
-  }
+  const candidates = await Promise.all(
+    files.map((f) => classifyFile(f, cache, force)),
+  );
 
   const toProcess = candidates.filter((c) => c.status !== "CACHED");
   const skipped = candidates.filter((c) => c.status === "CACHED");
@@ -277,50 +344,54 @@ export async function ingestBatch(opts?: IngestBatchOptions): Promise<void> {
   let processed = 0;
   let failed = 0;
 
-  if (concurrency > 1) {
-    let nextIdx = 0;
-    const workers = Array.from({ length: Math.min(concurrency, toProcess.length) }, async () => {
-      while (nextIdx < toProcess.length) {
-        const idx = nextIdx++;
-        const c = toProcess[idx]!;
-        console.log(`\n[${idx + 1}/${toProcess.length}] Ingesting: ${c.relativePath}`);
+  const apiSemaphore = new Semaphore(concurrency);
+  const ioMutex = new Semaphore(1);
+  const progress = new ProgressTracker(toProcess.length, "ingest");
+
+  const results = await Promise.allSettled(
+    toProcess.map(async (c) => {
+      await apiSemaphore.acquire();
+      try {
+        const result = await ingestSingleInternal(c.absolutePath, cache, c.contentHash);
+
+        await ioMutex.acquire();
         try {
-          const result = await ingestSingleInternal(c.absolutePath, cache, c.contentHash);
           if (result) {
             processed++;
             await saveIngestCache(cache);
           } else {
             failed++;
           }
-        } catch (err) {
-          failed++;
-          console.log(`  Error processing ${c.relativePath}: ${err instanceof Error ? err.message : err}`);
-        }
-      }
-    });
-    await Promise.all(workers);
-  } else {
-    for (let i = 0; i < toProcess.length; i++) {
-      const c = toProcess[i]!;
-      console.log(`\n[${i + 1}/${toProcess.length}] Ingesting: ${c.relativePath}`);
-      try {
-        const result = await ingestSingleInternal(c.absolutePath, cache, c.contentHash);
-        if (result) {
-          processed++;
-          await saveIngestCache(cache);
-        } else {
-          failed++;
+          progress.tick(c.relativePath);
+        } finally {
+          ioMutex.release();
         }
       } catch (err) {
-        failed++;
+        await ioMutex.acquire();
+        try {
+          failed++;
+          progress.tick(`FAILED: ${c.relativePath}`);
+        } finally {
+          ioMutex.release();
+        }
         console.log(`  Error processing ${c.relativePath}: ${err instanceof Error ? err.message : err}`);
+      } finally {
+        apiSemaphore.release();
       }
+    }),
+  );
+
+  // Check for unhandled rejections
+  for (const result of results) {
+    if (result.status === "rejected") {
+      console.log(`  Unexpected error: ${result.reason}`);
     }
   }
 
   await saveIngestCache(cache);
 
   console.log(`\nBatch complete. Processed: ${processed}, Failed: ${failed}, Skipped: ${skipped.length}`);
+  usageTracker.printSummary();
 }
 
 /** @deprecated Use ingestSingle instead */

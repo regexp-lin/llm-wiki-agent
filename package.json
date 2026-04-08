@@ -15,7 +15,10 @@
     "lint": "eslint src/",
     "format": "prettier --write 'src/**/*.ts'",
     "format:check": "prettier --check 'src/**/*.ts'",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/**/*.test.ts",
+    "test:unit": "tsx --test src/shared/*.test.ts",
+    "test:workflow": "tsx --test src/workflows/*.test.ts"
   },
   "bin": {
     "wiki-ingest": "./dist/cli/ingest.js",
@@ -32,7 +35,9 @@
     "commander": "^14.0.3",
     "graphology": "^0.26.0",
     "graphology-communities-louvain": "^2.0.2",
-    "open": "^11.0.0"
+    "open": "^11.0.0",
+    "vis-network": "^10.0.2",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

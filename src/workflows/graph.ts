@@ -1,6 +1,7 @@
-import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createRequire } from "node:module";
 
 import {
   REPO_ROOT,
@@ -9,11 +10,12 @@ import {
   GRAPH_HTML,
   CACHE_FILE,
   TYPE_COLORS,
+  TYPE_SHAPES,
   EDGE_COLORS,
   COMMUNITY_COLORS,
   MODEL_HAIKU,
 } from "../shared/constants.js";
-import { readFile, appendLog } from "../shared/file-utils.js";
+import { readFile, appendLog, readFilesParallel } from "../shared/file-utils.js";
 import {
   allWikiPages,
   extractWikilinks,
@@ -21,21 +23,20 @@ import {
   extractTitle,
   pageId,
 } from "../shared/wiki-utils.js";
-import { getClient, parseJsonArrayFromResponse } from "../shared/llm-utils.js";
+import { callLlm, parseJsonArrayFromResponse } from "../shared/llm-utils.js";
+import { sha256Full } from "../shared/crypto-utils.js";
+import { InferredRelationSchema } from "../shared/validators.js";
+import { ProgressTracker } from "../shared/progress.js";
+import { Semaphore } from "../shared/semaphore.js";
+import { usageTracker } from "../shared/usage-tracker.js";
 import { UndirectedGraph } from "graphology";
 import louvainImport from "graphology-communities-louvain";
 
-// graphology-communities-louvain is CJS; under NodeNext the default import
-// wraps module.exports but TypeScript may misinterpret the call signature.
 const louvain = louvainImport as unknown as (
   graph: InstanceType<typeof UndirectedGraph>,
   options?: { randomWalk?: boolean },
 ) => Record<string, number>;
 import type { GraphNode, GraphEdge, GraphCache } from "../shared/types.js";
-
-function sha256(text: string): string {
-  return crypto.createHash("sha256").update(text).digest("hex");
-}
 
 async function loadCache(): Promise<GraphCache> {
   try {
@@ -63,6 +64,7 @@ function buildNodes(pages: string[], contents: Map<string, string>): GraphNode[]
       label,
       type: nodeType,
       color: TYPE_COLORS[nodeType] ?? TYPE_COLORS["unknown"]!,
+      shape: TYPE_SHAPES[nodeType] ?? TYPE_SHAPES["unknown"]!,
       path: path.relative(REPO_ROOT, p),
     });
   }
@@ -110,14 +112,14 @@ async function buildInferredEdges(
   contents: Map<string, string>,
   existingEdges: GraphEdge[],
   cache: GraphCache,
+  concurrency = 5,
 ): Promise<GraphEdge[]> {
-  const client = getClient();
   const newEdges: GraphEdge[] = [];
 
   const changedPages: string[] = [];
   for (const p of pages) {
     const content = contents.get(p) ?? "";
-    const h = sha256(content);
+    const h = sha256Full(content);
     if (cache[p] !== h) {
       changedPages.push(p);
       cache[p] = h;
@@ -139,17 +141,25 @@ async function buildInferredEdges(
     .map((e) => `- ${e.from} → ${e.to} (EXTRACTED)`)
     .join("\n");
 
-  for (const p of changedPages) {
-    const content = (contents.get(p) ?? "").slice(0, 2000);
-    const src = pageId(p);
+  const validNodeIds = new Set(pages.map((p) => pageId(p)));
+  const semaphore = new Semaphore(concurrency);
+  const progress = new ProgressTracker(changedPages.length, "inference");
 
-    const response = await client.messages.create({
-      model: MODEL_HAIKU,
-      max_tokens: 1024,
-      messages: [
-        {
-          role: "user",
-          content: `Analyze this wiki page and identify implicit semantic relationships to other pages in the wiki.
+  const results = await Promise.allSettled(
+    changedPages.map(async (p) => {
+      await semaphore.acquire();
+      try {
+        const content = (contents.get(p) ?? "").slice(0, 2000);
+        const src = pageId(p);
+
+        const response = await callLlm(
+          {
+            model: MODEL_HAIKU,
+            max_tokens: 1024,
+            messages: [
+              {
+                role: "user",
+                content: `Analyze this wiki page and identify implicit semantic relationships to other pages in the wiki.
 
 Source page: ${src}
 Content:
@@ -172,31 +182,49 @@ Rules:
 - Do not repeat edges already in the extracted list
 - Return empty array [] if no new relationships found
 `,
-        },
-      ],
-    });
+              },
+            ],
+          },
+          { workflow: "graph" },
+        );
 
-    const firstBlock = response.content[0];
-    if (firstBlock?.type !== "text") continue;
+        const firstBlock = response.content[0];
+        if (firstBlock?.type !== "text") return [];
 
-    try {
-      const inferred = parseJsonArrayFromResponse(firstBlock.text);
-      for (const rel of inferred) {
-        if (typeof rel === "object" && rel !== null && "to" in rel) {
-          const r = rel as Record<string, unknown>;
-          const edgeType = (r.type as string) ?? "INFERRED";
-          newEdges.push({
-            from: src,
-            to: r.to as string,
-            type: edgeType as "INFERRED" | "AMBIGUOUS",
-            label: (r.relationship as string) ?? "",
-            color: EDGE_COLORS[edgeType] ?? EDGE_COLORS["INFERRED"]!,
-            confidence: (r.confidence as number) ?? 0.7,
-          });
+        const pageEdges: GraphEdge[] = [];
+        try {
+          const inferred = parseJsonArrayFromResponse(firstBlock.text);
+          for (const rel of inferred) {
+            const parsed = InferredRelationSchema.safeParse(rel);
+            if (parsed.success && validNodeIds.has(parsed.data.to)) {
+              const { to, relationship, confidence, type: edgeType } = parsed.data;
+              pageEdges.push({
+                from: src,
+                to,
+                type: edgeType,
+                label: relationship ?? "",
+                color: EDGE_COLORS[edgeType] ?? EDGE_COLORS["INFERRED"]!,
+                confidence,
+              });
+            }
+          }
+        } catch {
+          // skip unparseable response
         }
+
+        progress.tick(src);
+        return pageEdges;
+      } finally {
+        semaphore.release();
       }
-    } catch {
-      // skip unparseable response
+    }),
+  );
+
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      newEdges.push(...result.value);
+    } else {
+      console.warn(`  inference failed: ${result.reason}`);
     }
   }
 
@@ -234,9 +262,24 @@ function detectCommunities(nodes: GraphNode[], edges: GraphEdge[]): Map<string, 
   }
 }
 
+function getVisNetworkSource(): string {
+  try {
+    const require = createRequire(import.meta.url);
+    const visPath = require.resolve("vis-network/standalone/umd/vis-network.min.js");
+    return readFileSync(visPath, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
 function renderHtml(nodes: GraphNode[], edges: GraphEdge[]): string {
   const nodesJson = JSON.stringify(nodes, null, 2);
   const edgesJson = JSON.stringify(edges, null, 2);
+
+  const visSource = getVisNetworkSource();
+  const scriptTag = visSource
+    ? `<script>${visSource}</script>`
+    : `<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>`;
 
   const legendItems = Object.entries(TYPE_COLORS)
     .filter(([t]) => t !== "unknown")
@@ -251,7 +294,7 @@ function renderHtml(nodes: GraphNode[], edges: GraphEdge[]): string {
 <head>
 <meta charset="UTF-8">
 <title>LLM Wiki — Knowledge Graph</title>
-<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+${scriptTag}
 <style>
   body { margin: 0; background: #1a1a2e; font-family: sans-serif; color: #eee; }
   #graph { width: 100vw; height: 100vh; }
@@ -293,7 +336,6 @@ const edges = new vis.DataSet(${edgesJson});
 const container = document.getElementById("graph");
 const network = new vis.Network(container, { nodes, edges }, {
   nodes: {
-    shape: "dot",
     size: 12,
     font: { color: "#eee", size: 13 },
     borderWidth: 2,
@@ -348,21 +390,15 @@ export async function buildGraph(infer: boolean = true, openBrowser?: boolean): 
   console.log(`Building graph from ${pages.length} wiki pages...`);
   await fs.mkdir(GRAPH_DIR, { recursive: true });
 
-  // Pre-read all page contents
-  const contents = new Map<string, string>();
-  for (const p of pages) {
-    contents.set(p, await readFile(p));
-  }
+  const contents = await readFilesParallel(pages);
 
   const cache = await loadCache();
 
-  // Pass 1: extracted edges
   console.log("  Pass 1: extracting wikilinks...");
   const nodes = buildNodes(pages, contents);
   const edges = buildExtractedEdges(pages, contents);
   console.log(`  → ${edges.length} extracted edges`);
 
-  // Pass 2: inferred edges
   if (infer) {
     console.log("  Pass 2: inferring semantic relationships...");
     const inferred = await buildInferredEdges(pages, contents, edges, cache);
@@ -371,23 +407,21 @@ export async function buildGraph(infer: boolean = true, openBrowser?: boolean): 
     await saveCache(cache);
   }
 
-  // Community detection
   console.log("  Running Louvain community detection...");
   const communities = detectCommunities(nodes, edges);
   for (const node of nodes) {
     const commId = communities.get(node.id) ?? -1;
-    if (commId >= 0) {
-      node.color = COMMUNITY_COLORS[commId % COMMUNITY_COLORS.length]!;
-    }
     node.group = commId;
+    if (commId >= 0) {
+      node.borderColor = COMMUNITY_COLORS[commId % COMMUNITY_COLORS.length]!;
+      node.borderWidth = 3;
+    }
   }
 
-  // Save graph.json
   const graphData = { nodes, edges, built: today };
   await fs.writeFile(GRAPH_JSON, JSON.stringify(graphData, null, 2), "utf-8");
   console.log(`  saved: graph/graph.json  (${nodes.length} nodes, ${edges.length} edges)`);
 
-  // Save graph.html
   const html = renderHtml(nodes, edges);
   await fs.writeFile(GRAPH_HTML, html, "utf-8");
   console.log("  saved: graph/graph.html");
@@ -397,6 +431,8 @@ export async function buildGraph(infer: boolean = true, openBrowser?: boolean): 
   await appendLog(
     `## [${today}] graph | Knowledge graph rebuilt\n\n${nodes.length} nodes, ${edges.length} edges (${extractedCount} extracted, ${inferredCount} inferred).`,
   );
+
+  usageTracker.printSummary();
 
   if (openBrowser) {
     const openModule = await import("open");
