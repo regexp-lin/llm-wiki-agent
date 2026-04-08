@@ -1,0 +1,47 @@
+{
+  "name": "llm-wiki-agent-nodejs",
+  "version": "1.0.0",
+  "description": "AI-powered knowledge management system - Node.js version",
+  "type": "module",
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev:ingest": "tsx src/cli/ingest.ts",
+    "dev:query": "tsx src/cli/query.ts",
+    "dev:lint": "tsx src/cli/lint.ts",
+    "dev:graph": "tsx src/cli/graph.ts",
+    "lint": "eslint src/",
+    "format": "prettier --write 'src/**/*.ts'",
+    "format:check": "prettier --check 'src/**/*.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "bin": {
+    "wiki-ingest": "./dist/cli/ingest.js",
+    "wiki-query": "./dist/cli/query.js",
+    "wiki-lint": "./dist/cli/lint.js",
+    "wiki-graph": "./dist/cli/graph.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "packageManager": "pnpm@10.30.3",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.85.0",
+    "commander": "^14.0.3",
+    "graphology": "^0.26.0",
+    "graphology-communities-louvain": "^2.0.2",
+    "open": "^11.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.5.2",
+    "eslint": "^10.2.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.8.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "typescript-eslint": "8.58.0"
+  }
+}

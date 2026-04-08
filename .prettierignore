@@ -1,0 +1,6 @@
+dist/
+node_modules/
+graph/
+wiki/
+raw/
+pnpm-lock.yaml
