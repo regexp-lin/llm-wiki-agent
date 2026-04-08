@@ -18,6 +18,8 @@
 │  CLAUDE.md  AGENTS.md  AGENTS.md    GEMINI.md       │
 │  + .claude/ + .cursor/              + AGENTS.md     │
 │    commands/  rules/                + .agent/rules/  │
+│              skills/                                 │
+│              agents/                                 │
 └──────────────────┬───────────────────────────────────┘
                    │
                    ▼
@@ -63,11 +65,31 @@
 | IDE | 指令格式 | 文件 |
 |---|---|---|
 | Claude Code | Markdown + slash commands | `CLAUDE.md`, `.claude/commands/` |
-| Cursor | MDC (Markdown + YAML frontmatter) | `.cursor/rules/*.mdc` |
+| Cursor | MDC Rules + Skills + Agents | `.cursor/rules/*.mdc`, `.cursor/skills/*/SKILL.md`, `.cursor/agents/*.md` |
 | Codex / OpenCode | Markdown | `AGENTS.md` |
 | Antigravity / Gemini | Markdown | `GEMINI.md`, `.agent/rules/` |
 
 所有 IDE 指令文件共享同一个 `WIKI_SCHEMA.md`，确保 wiki 数据模型的一致性。
+
+#### Cursor Skills 架构
+
+Cursor 使用 Skills 按需加载工作流指令，替代原来的 always-apply 单体规则：
+
+```
+.cursor/
+├── rules/
+│   ├── wiki-conventions.mdc      # always-apply 基础约定 (~30行)
+│   └── wiki-source-code.mdc      # glob-based TypeScript 约定
+├── skills/
+│   ├── wiki-ingest/SKILL.md      # 知识摄入 (按需加载)
+│   ├── wiki-query/SKILL.md       # 知识查询 (按需加载)
+│   ├── wiki-lint/SKILL.md        # 健康检查 (按需加载)
+│   └── wiki-graph/SKILL.md       # 知识图谱 (按需加载)
+└── agents/
+    └── wiki-researcher.md        # 深度分析 subagent
+```
+
+优势：token 消耗从 ~112 行 always-loaded 降至 ~30 行 always + ~60-80 行按需加载。
 
 ### Layer 2: Wiki Schema 层
 
@@ -238,8 +260,9 @@ interface GraphData { nodes, edges, built }
 4. 在 `package.json` 的 `scripts` 和 `bin` 中添加命令
 5. 更新所有 IDE 指令文件，添加新工作流的触发方式
 6. 更新 `.claude/commands/` 添加 slash command
-7. 更新 `.cursor/rules/wiki-agent.mdc` 添加工作流步骤
-8. 更新 `.agent/rules/wiki-workflows.md` 添加规则
+7. 创建 `.cursor/skills/wiki-<name>/SKILL.md` 和 `workflow-detail.md`
+8. 更新 `.cursor/rules/wiki-conventions.mdc` 中的 Available Workflows 列表
+9. 更新 `.agent/rules/wiki-workflows.md` 添加规则
 
 ### 更换 LLM Provider
 
